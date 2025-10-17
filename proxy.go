@@ -2,16 +2,20 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
 )
+
+var gzipReaderPool = sync.Pool{New: func() any { return new(gzip.Reader) }}
 
 type ProxyTrace struct {
 	StartTime  time.Time
@@ -27,6 +31,17 @@ type ProxyTrace struct {
 	ResponseHeaders http.Header
 	RequestBody     []byte
 	ResponseBody    []byte
+}
+
+func decompress(body []byte) ([]byte, error) {
+	reader := gzipReaderPool.Get().(*gzip.Reader)
+	defer gzipReaderPool.Put(reader)
+
+	if err := reader.Reset(bytes.NewReader(body)); err != nil {
+		return nil, err
+	}
+
+	return io.ReadAll(reader)
 }
 
 func (p *ProxyTrace) String() string {
@@ -48,7 +63,17 @@ func (p *ProxyTrace) String() string {
 	if strings.Contains(strings.ToLower(reqContentType), "application/json") ||
 		strings.Contains(strings.ToLower(reqContentType), "application/x-www-form-urlencoded") ||
 		strings.Contains(strings.ToLower(reqContentType), "text/") {
-		reqBodyString = string(p.RequestBody)
+
+		body := p.RequestBody
+		if contentEncoding := p.RequestHeaders.Get("Content-Encoding"); strings.Contains(strings.ToLower(contentEncoding), "gzip") {
+			if decompressed, err := decompress(p.RequestBody); err == nil {
+				body = decompressed
+			} else {
+				body = []byte(fmt.Sprintf("[gzip %s %s]", reqContentType, humanize.IBytes(uint64(len(body)))))
+			}
+		}
+		reqBodyString = string(body)
+
 	} else if reqContentType != "" && len(p.RequestBody) > 0 {
 		reqBodyString = fmt.Sprintf("[%s %s]", reqContentType, humanize.IBytes(uint64(len(p.RequestBody))))
 	}
@@ -64,7 +89,17 @@ func (p *ProxyTrace) String() string {
 	if strings.Contains(strings.ToLower(rspContentType), "application/json") ||
 		strings.Contains(strings.ToLower(rspContentType), "application/x-www-form-urlencoded") ||
 		strings.Contains(strings.ToLower(rspContentType), "text/") {
-		rspBodyString = string(p.ResponseBody)
+
+		body := p.ResponseBody
+		if contentEncoding := p.ResponseHeaders.Get("Content-Encoding"); strings.Contains(strings.ToLower(contentEncoding), "gzip") {
+			if decompressed, err := decompress(p.ResponseBody); err == nil {
+				body = decompressed
+			} else {
+				body = []byte(fmt.Sprintf("[gzip %s %s]", rspContentType, humanize.IBytes(uint64(len(body)))))
+			}
+		}
+		rspBodyString = string(body)
+
 	} else if rspContentType != "" && len(p.ResponseBody) > 0 {
 		rspBodyString = fmt.Sprintf("[%s %s]", rspContentType, humanize.IBytes(uint64(len(p.ResponseBody))))
 	}
@@ -75,7 +110,7 @@ func (p *ProxyTrace) String() string {
 	if reqHeaderString != "" {
 		builder.WriteString(fmt.Sprintf(" | 请求头: %s", reqHeaderString))
 	}
-	if trsHeaderString != "" {
+	if trsHeaderString != "" && trsHeaderString != reqHeaderString {
 		builder.WriteString(fmt.Sprintf(" | 转发头: %s", trsHeaderString))
 	}
 	if reqBodyString != "" {
