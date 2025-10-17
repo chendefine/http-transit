@@ -3,16 +3,18 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/miekg/dns"
 )
 
 var gzipReaderPool = sync.Pool{New: func() any { return new(gzip.Reader) }}
@@ -142,15 +144,106 @@ func NewProxyHandler(config *Config) *ProxyHandler {
 	return handler
 }
 
-// 初始化所有域名的连接池
-func (p *ProxyHandler) initializeClientPools() {
-	for _, rule := range p.config.TransitMap {
-		if _, ok := p.clients[rule.BackendBase]; ok {
-			continue
+// resolveHostWithDNS 使用指定的DNS服务器直接查询域名，完全绕过系统hosts文件
+func resolveHostWithDNS(host, dnsServer string) (string, error) {
+	// 添加默认DNS端口
+	if ip := net.ParseIP(dnsServer); ip != nil {
+		dnsServer = net.JoinHostPort(dnsServer, "53")
+	}
+
+	c := dns.Client{Timeout: 5 * time.Second}
+
+	// 先尝试A记录 (IPv4)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeA)
+	m.RecursionDesired = true
+
+	r, _, err := c.Exchange(m, dnsServer)
+	if err != nil {
+		return "", fmt.Errorf("DNS查询失败 (使用 %s): %v", dnsServer, err)
+	} else if r.Rcode != dns.RcodeSuccess {
+		return "", fmt.Errorf("DNS查询返回错误码: %d (使用 %s)", r.Rcode, dnsServer)
+	}
+
+	// 提取A记录
+	for _, ans := range r.Answer {
+		if a, ok := ans.(*dns.A); ok {
+			ip := a.A.String()
+			log.Debugf("DNS解析: %s -> %s (DNS server: %s)", host, ip, dnsServer)
+			return ip, nil
+		}
+	}
+
+	// 如果没有A记录，尝试AAAA记录 (IPv6)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeAAAA)
+	r, _, err = c.Exchange(m, dnsServer)
+	if err != nil {
+		return "", fmt.Errorf("DNS查询IPv6失败 (DNS server: %s): %v", dnsServer, err)
+	} else if r.Rcode != dns.RcodeSuccess {
+		return "", fmt.Errorf("DNS查询返回错误码: %d (使用 %s)", r.Rcode, dnsServer)
+	}
+
+	for _, ans := range r.Answer {
+		if aaaa, ok := ans.(*dns.AAAA); ok {
+			ip := aaaa.AAAA.String()
+			log.Debugf("DNS解析: %s -> %s (DNS server: %s)", host, ip, dnsServer)
+			return ip, nil
+		}
+	}
+
+	return "", fmt.Errorf("未找到IP地址: %s (DNS server: %s)", host, dnsServer)
+}
+
+// createIPDialer 创建一个直接使用IP地址连接的拨号器
+func createIPDialer(ip string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// 提取端口
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
 		}
 
-		domain := p.extractDomain(rule.BackendBase)
+		// 直接使用配置的IP地址连接
+		resolvedAddr := net.JoinHostPort(ip, port)
+		d := net.Dialer{Timeout: 30 * time.Second}
+		log.Debugf("使用配置的IP地址连接: %s -> %s", addr, resolvedAddr)
+		return d.DialContext(ctx, network, resolvedAddr)
+	}
+}
 
+// createDnsResolvDialer creates a dialer that uses a custom DNS resolver, bypassing system hosts file
+func createDnsResolvDialer(dnsServer string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	// Return a custom dialer function
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Extract host and port from addr
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+
+		// 如果已经是IP地址，直接连接
+		if net.ParseIP(host) != nil {
+			d := net.Dialer{Timeout: 30 * time.Second}
+			return d.DialContext(ctx, network, addr)
+		}
+
+		// 使用自定义DNS服务器解析，完全绕过系统hosts文件
+		ip, err := resolveHostWithDNS(host, dnsServer)
+		if err != nil {
+			return nil, err
+		}
+
+		// 使用解析后的IP地址连接
+		resolvedAddr := net.JoinHostPort(ip, port)
+		d := net.Dialer{Timeout: 30 * time.Second}
+		log.Debugf("使用自定义DNS解析器: %s -> %s", host, resolvedAddr)
+		return d.DialContext(ctx, network, resolvedAddr)
+	}
+}
+
+// 初始化所有域名的连接池
+func (p *ProxyHandler) initializeClientPools() {
+	for host, rule := range p.config.TransitMap {
 		transport := &http.Transport{
 			MaxIdleConns:        100,             // 降低全局最大空闲连接数
 			MaxIdleConnsPerHost: 20,              // 增加每个主机的最大空闲连接数
@@ -159,32 +252,23 @@ func (p *ProxyHandler) initializeClientPools() {
 			DisableCompression:  false,           // 启用压缩
 		}
 
+		// 按优先级设置拨号器：IP > DNS > 系统默认
+		if rule.Resolve.IP != "" {
+			// 优先级最高：直接使用IP连接
+			transport.DialContext = createIPDialer(rule.Resolve.IP)
+		} else if rule.Resolve.DNS != "" {
+			// 优先级次之：使用指定DNS服务器
+			transport.DialContext = createDnsResolvDialer(rule.Resolve.DNS)
+		}
+		// 否则使用系统默认解析方式
+
 		client := &http.Client{
 			Transport: transport,
 			Timeout:   600 * time.Second, // 请求超时时间
 		}
 
-		p.clients[domain] = client
+		p.clients[host] = client
 	}
-}
-
-// 获取域名的HTTP客户端
-func (p *ProxyHandler) getClientForDomain(backendBase string) *http.Client {
-	domain := p.extractDomain(backendBase)
-	return p.clients[domain]
-}
-
-// 从backend_base中提取域名
-func (p *ProxyHandler) extractDomain(backendBase string) string {
-	if !strings.HasPrefix(backendBase, "http://") && !strings.HasPrefix(backendBase, "https://") {
-		backendBase = "http://" + backendBase
-	}
-
-	parsedURL, err := url.Parse(backendBase)
-	if err != nil {
-		return backendBase
-	}
-	return parsedURL.Host
 }
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -193,21 +277,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		host = host[:idx]
 	}
 
-	rule, exists := p.config.TransitMap[host]
-	if !exists {
-		log.Infof("未找到转发规则: %s", host)
-		http.Error(w, "转发规则未找到", http.StatusNotFound)
-		return
-	}
-
-	targetURL, err := p.buildTransitBackendURL(rule, r)
-	if err != nil {
-		log.Infof("构建目标URL失败: %v", err)
-		http.Error(w, "内部错误", http.StatusInternalServerError)
-		return
-	}
-
-	trace := p.forwardRequest(w, r, targetURL, rule)
+	trace := p.forwardRequest(w, r, host)
 	trace.Duration = time.Since(trace.StartTime)
 	log.Debug(trace)
 	if trace.Error != nil {
@@ -262,24 +332,34 @@ func (p *ProxyHandler) processHeaders(r *http.Request, rule TransitRule) http.He
 		headers.Set(key, value)
 	}
 
-	headers.Set("Host", p.extractHost(rule.BackendBase))
 	return headers
 }
 
-func (p *ProxyHandler) extractHost(backendBase string) string {
-	parsedURL, err := url.Parse(backendBase)
-	if err != nil {
-		return backendBase
-	}
-	return parsedURL.Host
-}
+func (p *ProxyHandler) forwardRequest(w http.ResponseWriter, r *http.Request, host string) *ProxyTrace {
+	trace := &ProxyTrace{StartTime: time.Now(), RequestURL: fmt.Sprintf("%s%s", host, r.URL.Path), Method: r.Method, RequestHeaders: r.Header}
 
-func (p *ProxyHandler) forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string, rule TransitRule) *ProxyTrace {
-	trace := &ProxyTrace{StartTime: time.Now(), RequestURL: fmt.Sprintf("%s%s", r.Host, r.URL.Path), BackendURL: targetURL, Method: r.Method, RequestHeaders: r.Header}
+	rule, ok := p.config.TransitMap[host]
+	if !ok {
+		trace.Error = fmt.Errorf("未找到转发规则: %s", host)
+		return trace
+	}
+	client, ok := p.clients[host]
+	if !ok {
+		trace.Error = fmt.Errorf("服务器未连接: %s", host)
+		return trace
+	}
+
+	targetURL, err := p.buildTransitBackendURL(rule, r)
+	if err != nil {
+		trace.Error = fmt.Errorf("构建目标URL失败: %w", err)
+		return trace
+	}
+
+	trace.BackendURL = targetURL
 
 	reqBody, err := io.ReadAll(r.Body)
 	if err != nil {
-		trace.Error = fmt.Errorf("读取请求体失败: %v", err)
+		trace.Error = fmt.Errorf("读取请求体失败: %w", err)
 		return trace
 	}
 	defer r.Body.Close()
@@ -287,15 +367,13 @@ func (p *ProxyHandler) forwardRequest(w http.ResponseWriter, r *http.Request, ta
 
 	req, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(reqBody))
 	if err != nil {
-		trace.Error = fmt.Errorf("创建请求失败: %v", err)
+		trace.Error = fmt.Errorf("创建请求失败: %w", err)
 		return trace
 	}
 
 	req.Header = p.processHeaders(r, rule)
 	trace.TransitHeaders = req.Header
 
-	// 使用域名特定的连接池中的HTTP客户端
-	client := p.getClientForDomain(rule.BackendBase)
 	resp, err := client.Do(req)
 	if err != nil {
 		trace.Error = fmt.Errorf("转发请求失败: %v", err)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -16,6 +17,11 @@ type LogConfig struct {
 	File  string `json:"file"`
 }
 
+type ResolveConfig struct {
+	DNS string `json:"dns"`
+	IP  string `json:"ip"`
+}
+
 type HeadersConfig struct {
 	Set           map[string]string `json:"set"`
 	Extra         map[string]string `json:"extra"`
@@ -28,7 +34,17 @@ type HeadersConfig struct {
 type TransitRule struct {
 	BackendBase   string        `json:"backend_base"`
 	BackendPrefix string        `json:"backend_prefix"`
+	Resolve       ResolveConfig `json:"resolve"`
 	Headers       HeadersConfig `json:"headers"`
+}
+
+func (r ResolveConfig) String() string {
+	if r.IP != "" {
+		return fmt.Sprintf("IP: %s", r.IP)
+	} else if r.DNS != "" {
+		return fmt.Sprintf("DNS: %s", r.DNS)
+	}
+	return ""
 }
 
 type Config struct {
@@ -63,7 +79,16 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 
 	for host, rule := range config.TransitMap {
-		log.Infof("转发路由: %s -> %s%s", host, rule.BackendBase, rule.BackendPrefix)
+		if !strings.HasPrefix(rule.BackendBase, "http://") && !strings.HasPrefix(rule.BackendBase, "https://") {
+			rule.BackendBase = fmt.Sprintf("http://%s", rule.BackendBase)
+		}
+
+		if resolveInfo := rule.Resolve.String(); resolveInfo != "" {
+			log.Infof("转发路由: %s -> %s%s (解析%s)", host, rule.BackendBase, rule.BackendPrefix, resolveInfo)
+		} else {
+			log.Infof("转发路由: %s -> %s%s", host, rule.BackendBase, rule.BackendPrefix)
+		}
+
 		if len(rule.Headers.Remove) > 0 {
 			rule.Headers.removes = make(map[string]struct{})
 			for _, remove := range rule.Headers.Remove {
