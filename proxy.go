@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -241,33 +242,87 @@ func createDnsResolvDialer(dnsServer string) func(ctx context.Context, network, 
 	}
 }
 
+// extractBackendHost 提取后端URL的 scheme://host:port 部分作为连接池键
+func extractBackendHost(backendBase string) (string, error) {
+	parsed, err := url.Parse(backendBase)
+	if err != nil {
+		return "", fmt.Errorf("解析后端URL失败: %w", err)
+	}
+	return parsed.Scheme + "://" + parsed.Host, nil
+}
+
+// findMatchingRule 查找请求路径最长匹配的路径前缀
+func findMatchingRule(routes TransitRoutes, requestPath string) (string, TransitRule, bool) {
+	var longestPrefix string
+	var matchedRule TransitRule
+	found := false
+
+	for prefix, rule := range routes {
+		if strings.HasPrefix(requestPath, prefix) {
+			if len(prefix) > len(longestPrefix) {
+				longestPrefix = prefix
+				matchedRule = rule
+				found = true
+			}
+		}
+	}
+
+	return longestPrefix, matchedRule, found
+}
+
 // 初始化所有域名的连接池
 func (p *ProxyHandler) initializeClientPools() {
-	for host, rule := range p.config.TransitMap {
-		transport := &http.Transport{
-			MaxIdleConns:        100,             // 降低全局最大空闲连接数
-			MaxIdleConnsPerHost: 20,              // 增加每个主机的最大空闲连接数
-			MaxConnsPerHost:     100,             // 增加每个主机的最大连接数
-			IdleConnTimeout:     5 * time.Minute, // 空闲连接超时时间
-			DisableCompression:  false,           // 启用压缩
-		}
+	// 跟踪已创建的后端连接池，避免重复创建
+	poolCreated := make(map[string]bool)
 
-		// 按优先级设置拨号器：IP > DNS > 系统默认
-		if rule.Resolve.IP != "" {
-			// 优先级最高：直接使用IP连接
-			transport.DialContext = createIPDialer(rule.Resolve.IP)
-		} else if rule.Resolve.DNS != "" {
-			// 优先级次之：使用指定DNS服务器
-			transport.DialContext = createDnsResolvDialer(rule.Resolve.DNS)
-		}
-		// 否则使用系统默认解析方式
+	for host, routes := range p.config.TransitMap {
+		for pathPrefix, rule := range routes {
+			// 提取后端主机 (scheme://host:port) 作为连接池键
+			poolKey, err := extractBackendHost(rule.BackendBase)
+			if err != nil {
+				log.Errorf("无法提取后端主机 (domain: %s, path: %s): %v", host, pathPrefix, err)
+				continue
+			}
 
-		client := &http.Client{
-			Transport: transport,
-			Timeout:   600 * time.Second, // 请求超时时间
-		}
+			// 如果该后端的连接池已创建，则复用
+			if poolCreated[poolKey] {
+				log.Debugf("复用连接池: %s%s -> %s (池: %s)", host, pathPrefix, rule.BackendBase, poolKey)
+				continue
+			}
 
-		p.clients[host] = client
+			// 创建 HTTP Transport 配置连接池
+			transport := &http.Transport{
+				MaxIdleConns:        100,             // 全局最大空闲连接数
+				MaxIdleConnsPerHost: 20,              // 每个主机的最大空闲连接数
+				MaxConnsPerHost:     100,             // 每个主机的最大连接数
+				IdleConnTimeout:     5 * time.Minute, // 空闲连接超时时间
+				DisableCompression:  false,           // 启用压缩
+			}
+
+			// 配置 DNS/IP 解析
+			// 优先级: IP > DNS > 系统默认
+			if rule.Resolve.IP != "" {
+				transport.DialContext = createIPDialer(rule.Resolve.IP)
+				log.Debugf("连接池配置: %s (使用IP: %s)", poolKey, rule.Resolve.IP)
+			} else if rule.Resolve.DNS != "" {
+				transport.DialContext = createDnsResolvDialer(rule.Resolve.DNS)
+				log.Debugf("连接池配置: %s (使用DNS: %s)", poolKey, rule.Resolve.DNS)
+			} else {
+				log.Debugf("连接池配置: %s (系统默认解析)", poolKey)
+			}
+
+			// 创建 HTTP 客户端
+			client := &http.Client{
+				Transport: transport,
+				Timeout:   600 * time.Second, // 请求超时时间
+			}
+
+			// 存储客户端到连接池映射
+			p.clients[poolKey] = client
+			poolCreated[poolKey] = true
+
+			log.Infof("创建连接池: %s (首次使用: %s%s)", poolKey, host, pathPrefix)
+		}
 	}
 }
 
@@ -288,18 +343,34 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *ProxyHandler) buildTransitBackendURL(rule TransitRule, r *http.Request) (string, error) {
+func (p *ProxyHandler) buildTransitBackendURL(matchedPrefix string, rule TransitRule, r *http.Request) (string, error) {
 	backendBase := strings.TrimSuffix(rule.BackendBase, "/")
-	path := rule.BackendPrefix + r.URL.Path
 
+	// 从请求路径中剥离匹配的前缀
+	strippedPath := strings.TrimPrefix(r.URL.Path, matchedPrefix)
+
+	// 处理边界情况：如果剥离后路径为空，使用 "/"
+	if strippedPath == "" {
+		strippedPath = "/"
+	} else if !strings.HasPrefix(strippedPath, "/") {
+		// 确保剥离后的路径以 / 开头（防御性编程）
+		strippedPath = "/" + strippedPath
+	}
+
+	// 组合后端前缀和剥离后的路径
+	path := rule.BackendPrefix + strippedPath
+
+	// 添加查询字符串（如果存在）
 	if r.URL.RawQuery != "" {
 		path += "?" + r.URL.RawQuery
 	}
 
+	// 确保最终路径以 / 开头
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
 
+	// 验证后端 base 包含协议
 	if !strings.HasPrefix(backendBase, "http://") && !strings.HasPrefix(backendBase, "https://") {
 		backendBase = "http://" + backendBase
 	}
@@ -338,18 +409,35 @@ func (p *ProxyHandler) processHeaders(r *http.Request, rule TransitRule) http.He
 func (p *ProxyHandler) forwardRequest(w http.ResponseWriter, r *http.Request, host string) *ProxyTrace {
 	trace := &ProxyTrace{StartTime: time.Now(), RequestURL: fmt.Sprintf("%s%s", host, r.URL.Path), Method: r.Method, RequestHeaders: r.Header}
 
-	rule, ok := p.config.TransitMap[host]
+	// 步骤 1: 获取该域名的路由规则
+	routes, ok := p.config.TransitMap[host]
 	if !ok {
 		trace.Error = fmt.Errorf("未找到转发规则: %s", host)
 		return trace
 	}
-	client, ok := p.clients[host]
-	if !ok {
-		trace.Error = fmt.Errorf("服务器未连接: %s", host)
+
+	// 步骤 2: 根据路径前缀查找匹配的规则（最长匹配）
+	matchedPrefix, rule, found := findMatchingRule(routes, r.URL.Path)
+	if !found {
+		trace.Error = fmt.Errorf("未找到匹配的路径规则: %s%s", host, r.URL.Path)
 		return trace
 	}
 
-	targetURL, err := p.buildTransitBackendURL(rule, r)
+	// 步骤 3: 获取该后端的连接池
+	poolKey, err := extractBackendHost(rule.BackendBase)
+	if err != nil {
+		trace.Error = fmt.Errorf("提取后端主机失败: %w", err)
+		return trace
+	}
+
+	client, ok := p.clients[poolKey]
+	if !ok {
+		trace.Error = fmt.Errorf("连接池未找到: %s", poolKey)
+		return trace
+	}
+
+	// 步骤 4: 构建目标 URL（进行路径剥离）
+	targetURL, err := p.buildTransitBackendURL(matchedPrefix, rule, r)
 	if err != nil {
 		trace.Error = fmt.Errorf("构建目标URL失败: %w", err)
 		return trace

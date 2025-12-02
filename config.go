@@ -38,6 +38,17 @@ type TransitRule struct {
 	Headers       HeadersConfig `json:"headers"`
 }
 
+// URL path前缀转发规则
+type TransitRoutes map[string]TransitRule
+
+type Config struct {
+	Server ServerConfig `json:"server"`
+	Log    LogConfig    `json:"log"`
+
+	// URL域名转发
+	TransitMap map[string]TransitRoutes `json:"transit_map"`
+}
+
 func (r ResolveConfig) String() string {
 	if r.IP != "" {
 		return fmt.Sprintf("IP: %s", r.IP)
@@ -45,12 +56,6 @@ func (r ResolveConfig) String() string {
 		return fmt.Sprintf("DNS: %s", r.DNS)
 	}
 	return ""
-}
-
-type Config struct {
-	Server     ServerConfig           `json:"server"`
-	Log        LogConfig              `json:"log"`
-	TransitMap map[string]TransitRule `json:"transit_map"`
 }
 
 func LoadConfig(filename string) (*Config, error) {
@@ -78,22 +83,38 @@ func LoadConfig(filename string) (*Config, error) {
 		}
 	}
 
-	for host, rule := range config.TransitMap {
-		if !strings.HasPrefix(rule.BackendBase, "http://") && !strings.HasPrefix(rule.BackendBase, "https://") {
-			rule.BackendBase = fmt.Sprintf("http://%s", rule.BackendBase)
-		}
-
-		if resolveInfo := rule.Resolve.String(); resolveInfo != "" {
-			log.Infof("转发路由: %s -> %s%s (解析%s)", host, rule.BackendBase, rule.BackendPrefix, resolveInfo)
-		} else {
-			log.Infof("转发路由: %s -> %s%s", host, rule.BackendBase, rule.BackendPrefix)
-		}
-
-		if len(rule.Headers.Remove) > 0 {
-			rule.Headers.removes = make(map[string]struct{})
-			for _, remove := range rule.Headers.Remove {
-				rule.Headers.removes[strings.ToLower(remove)] = struct{}{}
+	for host, routes := range config.TransitMap {
+		for pathPrefix, rule := range routes {
+			// 验证路径前缀
+			if pathPrefix == "" {
+				return nil, fmt.Errorf("空路径前缀 (host: %s)", host)
 			}
+			if !strings.HasPrefix(pathPrefix, "/") {
+				return nil, fmt.Errorf("路径前缀必须以 / 开头 (host: %s, prefix: %s)", host, pathPrefix)
+			}
+
+			// 规范化 backend_base URL
+			if !strings.HasPrefix(rule.BackendBase, "http://") && !strings.HasPrefix(rule.BackendBase, "https://") {
+				rule.BackendBase = fmt.Sprintf("http://%s", rule.BackendBase)
+			}
+
+			// 记录路由配置
+			if resolveInfo := rule.Resolve.String(); resolveInfo != "" {
+				log.Infof("转发路由: %s%s -> %s%s (解析%s)", host, pathPrefix, rule.BackendBase, rule.BackendPrefix, resolveInfo)
+			} else {
+				log.Infof("转发路由: %s%s -> %s%s", host, pathPrefix, rule.BackendBase, rule.BackendPrefix)
+			}
+
+			// 构建 removes 映射以便高效过滤 header
+			if len(rule.Headers.Remove) > 0 {
+				rule.Headers.removes = make(map[string]struct{})
+				for _, remove := range rule.Headers.Remove {
+					rule.Headers.removes[strings.ToLower(remove)] = struct{}{}
+				}
+			}
+
+			// 更新规则到 map（必需，因为我们修改了 rule）
+			routes[pathPrefix] = rule
 		}
 	}
 
